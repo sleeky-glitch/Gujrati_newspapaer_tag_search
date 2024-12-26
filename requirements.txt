@@ -1,0 +1,12 @@
+streamlit
+openai
+llama-index
+llama-index-core
+llama-index-embeddings-openai
+llama-index-llms-openai
+deep-translator
+sentence-transformers
+torch
+scikit-learn
+numpy
+pickle-mixin
