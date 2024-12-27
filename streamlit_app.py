@@ -7,8 +7,6 @@ from sklearn.metrics.pairwise import cosine_similarity
 import numpy as np
 import pickle
 import torch
-from datetime import datetime
-import re
 
 # Check if CUDA is available
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -27,28 +25,9 @@ def translate_to_gujarati(word):
         st.error(f"Translation error: {str(e)}")
         return None
 
-def parse_date_from_filename(filename):
-    # Extract date from filename format: Gujarat_Samachar_05-12-2024_page14_part2_text.txt
-    match = re.search(r'(\d{2}-\d{2}-\d{4})', filename)
-    if match:
-        try:
-            return datetime.strptime(match.group(1), '%d-%m-%Y')
-        except ValueError:
-            return None
-    return None
-
-def get_all_text_files(start_date=None, end_date=None):
+def get_all_text_files():
     try:
         text_files = glob.glob("data/*.txt")
-
-        if start_date and end_date:
-            filtered_files = []
-            for file_path in text_files:
-                file_date = parse_date_from_filename(os.path.basename(file_path))
-                if file_date and start_date <= file_date <= end_date:
-                    filtered_files.append(file_path)
-            return filtered_files
-
         return text_files
     except Exception as e:
         st.error(f"Error reading directory: {str(e)}")
@@ -61,10 +40,8 @@ def create_embeddings(model, articles_data):
         embeddings.append(embedding)
     return torch.stack(embeddings)
 
-def load_or_create_embeddings(model, start_date=None, end_date=None):
-    # Create a cache key based on the date range
-    date_range_str = f"{start_date.strftime('%Y%m%d')}_{end_date.strftime('%Y%m%d')}" if start_date and end_date else "all"
-    cache_file = f"data/embeddings_cache_{date_range_str}.pkl"
+def load_or_create_embeddings(model):
+    cache_file = "data/embeddings_cache.pkl"
 
     if os.path.exists(cache_file):
         with open(cache_file, 'rb') as f:
@@ -72,7 +49,7 @@ def load_or_create_embeddings(model, start_date=None, end_date=None):
             return cached_data['embeddings'], cached_data['articles_data']
 
     articles_data = []
-    text_files = get_all_text_files(start_date, end_date)
+    text_files = get_all_text_files()
 
     for file_path in text_files:
         try:
@@ -151,40 +128,19 @@ def main():
     st.title("AI-Powered Gujarati News Search")
     st.write("Semantic search for news articles in Gujarati")
 
-    # Add date range filters
-    col1, col2 = st.columns(2)
-    with col1:
-        start_date = st.date_input("Start Date", 
-                                  value=datetime.now().replace(day=1),
-                                  format="DD/MM/YYYY")
-    with col2:
-        end_date = st.date_input("End Date", 
-                                value=datetime.now(),
-                                format="DD/MM/YYYY")
-
-    if start_date > end_date:
-        st.error("Error: Start date must be before end date")
-        return
-
-    # Convert date inputs to datetime objects for comparison
-    start_datetime = datetime.combine(start_date, datetime.min.time())
-    end_datetime = datetime.combine(end_date, datetime.max.time())
-
-    # Load the model and embeddings with date filter
+    # Load the model and embeddings
     with st.spinner("Loading AI model..."):
         model = load_model()
-        embeddings, articles_data = load_or_create_embeddings(model, start_datetime, end_datetime)
+        embeddings, articles_data = load_or_create_embeddings(model)
 
     # Display available text files
-    text_files = get_all_text_files(start_datetime, end_datetime)
+    text_files = get_all_text_files()
     if text_files:
         with st.expander("Available Text Files"):
             for file in text_files:
-                file_date = parse_date_from_filename(os.path.basename(file))
-                date_str = file_date.strftime('%d-%m-%Y') if file_date else 'Unknown date'
-                st.write(f"📄 {os.path.basename(file)} ({date_str})")
+                st.write(f"📄 {os.path.basename(file)}")
     else:
-        st.warning(f"No articles found between {start_date.strftime('%d-%m-%Y')} and {end_date.strftime('%d-%m-%Y')}")
+        st.warning("No text files found in the data directory")
         return
 
     # Add radio button for search type
@@ -239,12 +195,11 @@ def main():
     st.markdown("---")
     st.markdown("""
     **Instructions:**
-    1. Select the date range for your search
-    2. Choose your search method
-    3. Adjust the relevance threshold as needed
-    4. Enter your search text
-    5. Click 'Search' to find semantically related articles
-    6. Results are sorted by relevance score
+    1. Choose your search method
+    2. Adjust the relevance threshold as needed
+    3. Enter your search text
+    4. Click 'Search' to find semantically related articles
+    5. Results are sorted by relevance score
     """)
 
     # Add information about keyboard support
@@ -275,4 +230,4 @@ if __name__ == "__main__":
     main()
 
 # Created/Modified files during execution:
-# - data/embeddings_cache_YYYYMMDD_YYYYMMDD.pkl (created for each unique date range when running for the first time)
+# - data/embeddings_cache.pkl (created when running for the first time or when content changes)
