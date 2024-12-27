@@ -3,44 +3,32 @@ from deep_translator import GoogleTranslator
 import os
 import glob
 from sentence_transformers import SentenceTransformer
+from sklearn.metrics.pairwise import cosine_similarity
 import numpy as np
 import pickle
 import torch
 from datetime import datetime
 import re
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain.embeddings import OpenAIEmbeddings
-from langchain.vectorstores import FAISS
-from langchain.chains import RetrievalQA
-from langchain.chat_models import ChatOpenAI
-from langchain.prompts import PromptTemplate
-import tiktoken
-
-# Initialize OpenAI API key from Streamlit secrets
-if 'OPENAI_API_KEY' not in st.secrets:
-    st.error('OPENAI_API_KEY not found in Streamlit secrets. Please add it to your app settings.')
-    st.stop()
-
-os.environ['OPENAI_API_KEY'] = st.secrets['OPENAI_API_KEY']
 
 # Check if CUDA is available
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-# Constants
-CHUNK_SIZE = 1000
-CHUNK_OVERLAP = 200
+@st.cache_resource
+def load_model():
+    # Using multilingual model to handle both English and Gujarati
+    return SentenceTransformer('paraphrase-multilingual-MiniLM-L12-v2').to(device)
 
-@st.cache_data(ttl=3600)  # Cache for 1 hour
-def translate_text(text, source='en', target='gu'):
+def translate_to_gujarati(word):
     try:
-        translator = GoogleTranslator(source=source, target=target)
-        translation = translator.translate(text)
+        translator = GoogleTranslator(source='en', target='gu')
+        translation = translator.translate(word)
         return translation
     except Exception as e:
         st.error(f"Translation error: {str(e)}")
         return None
 
 def parse_date_from_filename(filename):
+    # Extract date from filename format: Gujarat_Samachar_05-12-2024_page14_part2_text.txt
     match = re.search(r'(\d{2}-\d{2}-\d{4})', filename)
     if match:
         try:
@@ -49,10 +37,10 @@ def parse_date_from_filename(filename):
             return None
     return None
 
-@st.cache_data(ttl=3600)
-def get_text_files(start_date=None, end_date=None):
+def get_all_text_files(start_date=None, end_date=None):
     try:
         text_files = glob.glob("data/*.txt")
+
         if start_date and end_date:
             filtered_files = []
             for file_path in text_files:
@@ -60,193 +48,207 @@ def get_text_files(start_date=None, end_date=None):
                 if file_date and start_date <= file_date <= end_date:
                     filtered_files.append(file_path)
             return filtered_files
+
         return text_files
     except Exception as e:
         st.error(f"Error reading directory: {str(e)}")
         return []
 
-@st.cache_resource
-def create_index(_text_files):
-    # Combine all text files
-    combined_text = ""
-    for file_path in _text_files:
+def create_embeddings(model, articles_data):
+    embeddings = []
+    for article in articles_data:
+        embedding = model.encode(article['content'], convert_to_tensor=True)
+        embeddings.append(embedding)
+    return torch.stack(embeddings)
+
+def load_or_create_embeddings(model, start_date=None, end_date=None):
+    # Create a cache key based on the date range
+    date_range_str = f"{start_date.strftime('%Y%m%d')}_{end_date.strftime('%Y%m%d')}" if start_date and end_date else "all"
+    cache_file = f"data/embeddings_cache_{date_range_str}.pkl"
+
+    if os.path.exists(cache_file):
+        with open(cache_file, 'rb') as f:
+            cached_data = pickle.load(f)
+            return cached_data['embeddings'], cached_data['articles_data']
+
+    articles_data = []
+    text_files = get_all_text_files(start_date, end_date)
+
+    for file_path in text_files:
         try:
             with open(file_path, 'r', encoding='utf-8') as file:
-                combined_text += file.read() + "\n\n"
+                content = file.read()
+                articles = content.split('//')
+
+                for article in articles:
+                    if article.strip():
+                        articles_data.append({
+                            'file': os.path.basename(file_path),
+                            'content': article.strip()
+                        })
+
         except Exception as e:
             st.error(f"Error reading {file_path}: {str(e)}")
             continue
 
-    # Split text into chunks
-    text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=CHUNK_SIZE,
-        chunk_overlap=CHUNK_OVERLAP,
-        length_function=len
-    )
-    texts = text_splitter.split_text(combined_text)
+    embeddings = create_embeddings(model, articles_data)
 
-    # Create embeddings and index
-    embeddings = OpenAIEmbeddings()
-    vectorstore = FAISS.from_texts(texts, embeddings)
+    # Cache the embeddings
+    with open(cache_file, 'wb') as f:
+        pickle.dump({
+            'embeddings': embeddings,
+            'articles_data': articles_data
+        }, f)
 
-    return vectorstore
+    return embeddings, articles_data
 
-@st.cache_resource
-def setup_qa_chain(vectorstore):
-    # Create prompt template
-    template = """You are a helpful bilingual assistant that provides answers in both English and Gujarati.
-    Use the following context to answer the question. If you don't know the answer, just say you don't know.
+def semantic_search(query, model, embeddings, articles_data, threshold=0.3):
+    query_embedding = model.encode(query, convert_to_tensor=True)
 
-    Context: {context}
+    # Calculate cosine similarity
+    similarities = cosine_similarity(
+        query_embedding.cpu().numpy().reshape(1, -1),
+        embeddings.cpu().numpy()
+    )[0]
 
-    Question: {question}
+    # Get indices of articles above threshold, sorted by similarity
+    relevant_indices = np.where(similarities >= threshold)[0]
+    sorted_indices = relevant_indices[np.argsort(-similarities[relevant_indices])]
 
-    Please provide your answer in both English and Gujarati, clearly labeled as:
-    English:
-    [Your English answer here]
+    results = []
+    for idx in sorted_indices:
+        results.append({
+            'file': articles_data[idx]['file'],
+            'content': articles_data[idx]['content'],
+            'similarity': similarities[idx]
+        })
 
-    ગુજરાતી:
-    [Your Gujarati answer here]
-    """
+    return results
 
-    QA_CHAIN_PROMPT = PromptTemplate(
-        input_variables=["context", "question"],
-        template=template,
-    )
+def display_results(results):
+    if results:
+        st.subheader(f"Found {len(results)} Relevant Articles:")
 
-    # Setup QA chain
-    llm = ChatOpenAI(
-        model_name="gpt-4",
-        temperature=0.2,
-        max_tokens=512
-    )
+        # Group results by file
+        files_dict = {}
+        for result in results:
+            if result['file'] not in files_dict:
+                files_dict[result['file']] = []
+            files_dict[result['file']].append((result['content'], result['similarity']))
 
-    qa_chain = RetrievalQA.from_chain_type(
-        llm=llm,
-        chain_type="stuff",
-        retriever=vectorstore.as_retriever(search_kwargs={"k": 3}),
-        chain_type_kwargs={"prompt": QA_CHAIN_PROMPT}
-    )
-
-    return qa_chain
-
-@st.cache_resource
-def initialize_qa_system(_text_files):
-    vectorstore = create_index(_text_files)
-    qa_chain = setup_qa_chain(vectorstore)
-    return qa_chain
+        # Display results grouped by file
+        for file_name, articles in files_dict.items():
+            with st.expander(f"📄 {file_name} ({len(articles)} articles)"):
+                for idx, (article, similarity) in enumerate(articles, 1):
+                    st.markdown(f"**Article {idx}** (Relevance: {similarity:.2%})")
+                    st.write(article)
+                    if idx < len(articles):
+                        st.markdown("---")
+    else:
+        st.warning("No relevant articles found.")
 
 def main():
-    st.title("AI-Powered Bilingual News Q&A System")
-    st.write("Ask questions about news articles in English or Gujarati")
+    st.title("AI-Powered Gujarati News Search")
+    st.write("Semantic search for news articles in Gujarati")
 
-    # Initialize session state for storing conversation history
-    if 'conversation_history' not in st.session_state:
-        st.session_state.conversation_history = []
-
-    # Date range selection
+    # Add date range filters
     col1, col2 = st.columns(2)
     with col1:
-        start_date = st.date_input(
-            "Start Date",
-            value=datetime.now().replace(day=1),
-            format="DD/MM/YYYY"
-        )
+        start_date = st.date_input("Start Date", 
+                                  value=datetime.now().replace(day=1),
+                                  format="DD/MM/YYYY")
     with col2:
-        end_date = st.date_input(
-            "End Date",
-            value=datetime.now(),
-            format="DD/MM/YYYY"
-        )
+        end_date = st.date_input("End Date", 
+                                value=datetime.now(),
+                                format="DD/MM/YYYY")
 
     if start_date > end_date:
         st.error("Error: Start date must be before end date")
         return
 
-    # Convert dates to datetime
+    # Convert date inputs to datetime objects for comparison
     start_datetime = datetime.combine(start_date, datetime.min.time())
     end_datetime = datetime.combine(end_date, datetime.max.time())
 
-    # Get text files and initialize QA system
-    text_files = get_text_files(start_datetime, end_datetime)
-    if not text_files:
+    # Load the model and embeddings with date filter
+    with st.spinner("Loading AI model..."):
+        model = load_model()
+        embeddings, articles_data = load_or_create_embeddings(model, start_datetime, end_datetime)
+
+    # Display available text files
+    text_files = get_all_text_files(start_datetime, end_datetime)
+    if text_files:
+        with st.expander("Available Text Files"):
+            for file in text_files:
+                file_date = parse_date_from_filename(os.path.basename(file))
+                date_str = file_date.strftime('%d-%m-%Y') if file_date else 'Unknown date'
+                st.write(f"📄 {os.path.basename(file)} ({date_str})")
+    else:
         st.warning(f"No articles found between {start_date.strftime('%d-%m-%Y')} and {end_date.strftime('%d-%m-%Y')}")
         return
 
-    with st.spinner("Initializing QA System..."):
-        qa_chain = initialize_qa_system(tuple(text_files))
-
-    # Display available files
-    with st.expander("Available Text Files"):
-        for file in text_files:
-            file_date = parse_date_from_filename(os.path.basename(file))
-            date_str = file_date.strftime('%d-%m-%Y') if file_date else 'Unknown date'
-            st.write(f"📄 {os.path.basename(file)} ({date_str})")
-
-    # Language selection
-    input_language = st.radio(
-        "Choose input language:",
-        ["English", "Gujarati"],
+    # Add radio button for search type
+    search_type = st.radio(
+        "Choose search method:",
+        ["English to Gujarati", "Direct Gujarati Input"],
         horizontal=True
     )
 
-    # Question input
-    question = st.text_input(
-        "Enter your question:",
-        placeholder="Type your question here..."
+    # Add similarity threshold slider
+    threshold = st.slider(
+        "Relevance Threshold",
+        min_value=0.0,
+        max_value=1.0,
+        value=0.3,
+        step=0.05,
+        help="Adjust the minimum similarity score for matching articles"
     )
 
-    if question and st.button("Get Answer"):
-        with st.spinner("Processing your question..."):
-            # Translate question to English if it's in Gujarati
-            if input_language == "Gujarati":
-                question_en = translate_text(question, source='gu', target='en')
-                if not question_en:
-                    st.error("Failed to translate question")
-                    return
-            else:
-                question_en = question
+    if search_type == "English to Gujarati":
+        search_word = st.text_input("Enter text to search (in English):")
 
-            # Get answer from QA chain
-            response = qa_chain({"query": question_en})
-            answer = response['result']
+        if search_word:
+            with st.spinner("Translating..."):
+                gujarati_word = translate_to_gujarati(search_word)
 
-            # Add to conversation history
-            st.session_state.conversation_history.append({
-                "question": question,
-                "answer": answer
-            })
+            if gujarati_word:
+                st.success(f"Translated text: {gujarati_word}")
 
-            # Display results
-            st.subheader("Answer:")
-            st.write(answer)
+                if st.button("Search", key="english_search"):
+                    with st.spinner("Performing semantic search..."):
+                        results = semantic_search(gujarati_word, model, embeddings, articles_data, threshold)
+                        display_results(results)
 
-    # Display conversation history
-    if st.session_state.conversation_history:
-        with st.expander("Conversation History", expanded=False):
-            for i, exchange in enumerate(st.session_state.conversation_history, 1):
-                st.markdown(f"**Q{i}: {exchange['question']}**")
-                st.markdown(f"A{i}: {exchange['answer']}")
-                st.markdown("---")
-
-    # Add instructions
-    with st.expander("ℹ️ Instructions", expanded=False):
+    else:  # Direct Gujarati Input
         st.markdown("""
-        **How to use this Q&A system:**
-        1. Select the date range for your search
-        2. Choose your preferred input language
-        3. Type your question about the news articles
-        4. Click 'Get Answer' to receive a bilingual response
-        5. View your conversation history below the answer
-
-        **Tips for better results:**
-        - Be specific in your questions
-        - Include relevant dates or topics
-        - Questions can be about any content in the selected date range
+        💡 **Tip:** To type in Gujarati:
+        - Use Google Translate keyboard
+        - Use Windows Gujarati keyboard
+        - Copy and paste Gujarati text
         """)
 
-    # Gujarati typing help
-    with st.expander("🔤 How to type in Gujarati", expanded=False):
+        gujarati_word = st.text_input("Enter text in Gujarati:", key="gujarati_input")
+
+        if gujarati_word:
+            if st.button("Search", key="gujarati_search"):
+                with st.spinner("Performing semantic search..."):
+                    results = semantic_search(gujarati_word, model, embeddings, articles_data, threshold)
+                    display_results(results)
+
+    # Add footer with instructions
+    st.markdown("---")
+    st.markdown("""
+    **Instructions:**
+    1. Select the date range for your search
+    2. Choose your search method
+    3. Adjust the relevance threshold as needed
+    4. Enter your search text
+    5. Click 'Search' to find semantically related articles
+    6. Results are sorted by relevance score
+    """)
+
+    # Add information about keyboard support
+    with st.expander("ℹ️ How to type in Gujarati"):
         st.markdown("""
         **Options for typing in Gujarati:**
         1. **Google Input Tools:**
@@ -263,7 +265,14 @@ def main():
            - Install Gujarati keyboard from your app store
            - Switch to Gujarati input method
            - Type and share/copy the text
+
+        4. **Copy & Paste:**
+           - Use any online Gujarati typing tool
+           - Copy the text and paste it here
         """)
 
 if __name__ == "__main__":
     main()
+
+# Created/Modified files during execution:
+# - data/embeddings_cache_YYYYMMDD_YYYYMMDD.pkl (created for each unique date range when running for the first time)
