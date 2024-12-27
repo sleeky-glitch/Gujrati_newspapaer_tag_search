@@ -25,3 +25,5 @@ protobuf
 transformers
 accelerate
 bitsandbytes
+langchain-core
+langchain-community
